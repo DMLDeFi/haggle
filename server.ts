@@ -1,4 +1,5 @@
 import 'dotenv/config';
+import crypto from 'node:crypto';
 import express, { type Express } from 'express';
 import path from 'path';
 import { fileURLToPath } from 'url';
@@ -28,9 +29,25 @@ import {
   resetCatalogInDb,
 } from './src/db/repository';
 import { requireAuth, optionalAuth, type AuthRequest } from './src/middleware/auth';
+import {
+  getPublicGoogleClientId,
+  getGoogleOAuthCredentials,
+  hasDirectGoogleOAuthConfig,
+  parseCookies,
+  signToken,
+  verifySignedToken,
+  sanitizeReturnTo,
+  resolvePublicOrigin,
+  resolveGoogleRedirectUri,
+  isSecureRequest,
+  type OAuthStatePayload,
+  type SessionUser,
+} from './src/lib/oauthSession';
 
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
+const __filename =
+  typeof import.meta?.url === 'string' ? fileURLToPath(import.meta.url) : process.cwd();
+const __dirname =
+  typeof import.meta?.url === 'string' ? path.dirname(__filename) : process.cwd();
 
 const PAYPAL_API_BASE =
   process.env.PAYPAL_ENV === 'live'
@@ -163,21 +180,454 @@ Return JSON with a crisp, warm 1-2 sentence reply (maximum 25 words total) in fi
 
 export function createApiApp(): Express {
   const app = express();
-  app.use(express.json());
+  app.set('trust proxy', 1);
+  app.use(express.json({ limit: '20mb' }));
+  app.use(express.urlencoded({ extended: true, limit: '20mb' }));
 
-  // Normalize URL prefix for serverless rewrites (e.g. Vercel /api/* -> /api/index)
+  // Normalize URL prefix for serverless rewrites (e.g. Vercel /api/:path* -> /api/index?__path=:path*)
   app.use((req, _res, next) => {
+    // 1. Check if Vercel forwarded subpath in query (__path, 0, or catch-all path)
+    const rawCandidate = req.query?.__path ?? req.query?.['0'] ?? req.query?.path;
+    const rawQueryPath = Array.isArray(rawCandidate)
+      ? rawCandidate.map(String).join('/')
+      : typeof rawCandidate === 'string'
+        ? rawCandidate
+        : '';
+
+    if (rawQueryPath && (!req.url.startsWith('/api/') || req.url.startsWith('/api/index'))) {
+      const cleanPath = rawQueryPath.replace(/^\/+/, '');
+      const urlObj = new URL(req.url, 'http://localhost');
+      urlObj.pathname = `/api/${cleanPath}`;
+      urlObj.searchParams.delete('__path');
+      urlObj.searchParams.delete('0');
+      urlObj.searchParams.delete('path');
+      req.url = `${urlObj.pathname}${urlObj.search}`;
+    } else if (req.url.startsWith('/api/index')) {
+      // 2. If Vercel rewrote to /api/index or /api/index/...
+      const remainder = req.url.replace(/^\/api\/index/, '');
+      req.url = `/api${remainder.startsWith('/') ? '' : '/'}${remainder}`.replace(/\/+$/, '') || '/api';
+    }
+
+    // 3. Fallback header checks (x-matched-path, x-forwarded-uri, x-original-url)
+    const originalUrlHeader =
+      (req.headers['x-matched-path'] as string) ||
+      (req.headers['x-forwarded-uri'] as string) ||
+      (req.headers['x-original-url'] as string);
+
+    if (
+      originalUrlHeader &&
+      originalUrlHeader.startsWith('/api/') &&
+      (req.url === '/api/index' || req.url === '/api' || !req.url.startsWith('/api/'))
+    ) {
+      req.url = originalUrlHeader;
+    }
+
+    // 4. If path begins with known sub-routes without /api prefix
     if (!req.url.startsWith('/api/') && req.url !== '/api') {
       if (/^\/(items|negotiate|deals|paypal|seller|auth)(\/|$|\?)/.test(req.url)) {
         req.url = `/api${req.url}`;
       }
     }
+
     next();
   });
 
   // ---------------------------------------------------------------------------
-  // 0. FIREBASE AUTH USER SYNC ENDPOINT (Cloud SQL / Fallback users table)
+  // 0. AUTHENTICATION ENDPOINTS (Direct Google OAuth 2.0 + GSI + Firebase Sync)
   // ---------------------------------------------------------------------------
+  interface VerifiedGoogleProfile {
+    sub: string;
+    email: string;
+    name?: string;
+    picture?: string;
+  }
+
+  async function exchangeCodeForGoogleProfile(
+    code: string,
+    clientId: string,
+    clientSecret: string,
+    redirectUri: string
+  ): Promise<{ profile?: VerifiedGoogleProfile; errorCode?: string }> {
+    const tokenRes = await fetch('https://oauth2.googleapis.com/token', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({
+        code,
+        client_id: clientId,
+        client_secret: clientSecret,
+        redirect_uri: redirectUri,
+        grant_type: 'authorization_code',
+      }),
+    });
+
+    if (!tokenRes.ok) {
+      return { errorCode: 'token_exchange_failed' };
+    }
+
+    const tokenJson = (await tokenRes.json()) as { access_token?: string };
+    if (!tokenJson.access_token) {
+      return { errorCode: 'missing_access_token' };
+    }
+
+    const userRes = await fetch('https://www.googleapis.com/oauth2/v3/userinfo', {
+      headers: { Authorization: `Bearer ${tokenJson.access_token}` },
+    });
+
+    if (!userRes.ok) {
+      return { errorCode: 'profile_fetch_failed' };
+    }
+
+    const googleProfile = (await userRes.json()) as {
+      sub?: string;
+      email?: string;
+      email_verified?: boolean;
+      name?: string;
+      picture?: string;
+    };
+
+    if (!googleProfile.sub || !googleProfile.email || googleProfile.email_verified === false) {
+      return { errorCode: 'email_unverified' };
+    }
+
+    return {
+      profile: {
+        sub: googleProfile.sub,
+        email: googleProfile.email,
+        name: googleProfile.name,
+        picture: googleProfile.picture,
+      },
+    };
+  }
+
+  async function issueSessionForGoogleProfile(
+    req: express.Request,
+    res: express.Response,
+    profile: VerifiedGoogleProfile,
+    role: 'shopper' | 'maker'
+  ): Promise<{ user: SessionUser; token: string }> {
+    const uid = `google-${profile.sub}`;
+    await getOrCreateUser(uid, profile.email);
+
+    const sessionUser: SessionUser = {
+      uid,
+      email: profile.email,
+      name: profile.name || (role === 'maker' ? 'Studio Maker' : profile.email.split('@')[0]),
+      role,
+      photoUrl: profile.picture,
+    };
+
+    const sessionToken = signToken(sessionUser, 60 * 60 * 24 * 7);
+    res.cookie('haggle_session', sessionToken, {
+      httpOnly: true,
+      sameSite: 'lax',
+      secure: isSecureRequest(req),
+      path: '/',
+      maxAge: 7 * 24 * 60 * 60 * 1000,
+    });
+
+    return { user: sessionUser, token: sessionToken };
+  }
+
+  app.get('/api/auth/providers', (req, res) => {
+    res.json({
+      directGoogleEnabled: hasDirectGoogleOAuthConfig(),
+      googleClientId: getPublicGoogleClientId(),
+      redirectUri: resolveGoogleRedirectUri(req),
+      origin: resolvePublicOrigin(req),
+    });
+  });
+
+  app.get('/api/auth/session', (req, res) => {
+    const cookies = parseCookies(req.headers.cookie);
+    const authHeader = req.headers.authorization;
+    const bearer =
+      authHeader && authHeader.startsWith('Bearer ')
+        ? authHeader.slice('Bearer '.length).trim()
+        : null;
+    const rawToken = bearer || cookies.haggle_session;
+    const session = verifySignedToken<SessionUser>(rawToken);
+
+    if (!session) {
+      res.json({ authenticated: false, user: null, token: null });
+      return;
+    }
+
+    res.json({
+      authenticated: true,
+      user: {
+        uid: session.uid,
+        email: session.email,
+        name: session.name,
+        role: session.role,
+        photoUrl: session.photoUrl,
+      },
+      token: rawToken,
+    });
+  });
+
+  app.post('/api/auth/logout', (req, res) => {
+    const secure = isSecureRequest(req);
+    res.clearCookie('haggle_session', { path: '/', httpOnly: true, sameSite: 'lax', secure });
+    res.clearCookie('haggle_oauth_state', { path: '/', httpOnly: true, sameSite: 'lax', secure });
+    res.json({ ok: true });
+  });
+
+  app.get('/api/auth/google', (req, res) => {
+    const creds = getGoogleOAuthCredentials();
+    if (!creds) {
+      res.redirect('/login?auth_error=google_not_configured');
+      return;
+    }
+
+    const role = req.query.role === 'maker' ? 'maker' : 'shopper';
+    const mode = req.query.mode === 'signup' ? 'signup' : 'signin';
+    const returnTo = sanitizeReturnTo(req.query.returnTo || (role === 'maker' ? '/seller' : '/'));
+    const nonce = crypto.randomBytes(16).toString('hex');
+
+    const stateToken = signToken<OAuthStatePayload>({ nonce, role, mode, returnTo }, 10 * 60);
+
+    res.cookie('haggle_oauth_state', nonce, {
+      httpOnly: true,
+      sameSite: 'lax',
+      secure: isSecureRequest(req),
+      path: '/',
+      maxAge: 10 * 60 * 1000,
+    });
+
+    const authUrl = new URL('https://accounts.google.com/o/oauth2/v2/auth');
+    authUrl.searchParams.set('client_id', creds.clientId);
+    authUrl.searchParams.set('redirect_uri', resolveGoogleRedirectUri(req));
+    authUrl.searchParams.set('response_type', 'code');
+    authUrl.searchParams.set('scope', 'openid email profile');
+    authUrl.searchParams.set('prompt', 'select_account');
+    authUrl.searchParams.set('state', stateToken);
+
+    res.redirect(authUrl.toString());
+  });
+
+  app.get('/api/auth/google/callback', async (req, res) => {
+    const secure = isSecureRequest(req);
+    const clearStateCookie = () =>
+      res.clearCookie('haggle_oauth_state', { path: '/', httpOnly: true, sameSite: 'lax', secure });
+
+    if (req.query.error) {
+      clearStateCookie();
+      res.redirect(`/login?auth_error=${encodeURIComponent(String(req.query.error))}`);
+      return;
+    }
+
+    const creds = getGoogleOAuthCredentials();
+    const code = typeof req.query.code === 'string' ? req.query.code : '';
+    const rawState = typeof req.query.state === 'string' ? req.query.state : '';
+
+    if (!creds || !code || !rawState) {
+      clearStateCookie();
+      res.redirect('/login?auth_error=missing_oauth_params');
+      return;
+    }
+
+    const cookies = parseCookies(req.headers.cookie);
+    const verifiedState = verifySignedToken<OAuthStatePayload>(rawState);
+    if (!verifiedState || !cookies.haggle_oauth_state || verifiedState.nonce !== cookies.haggle_oauth_state) {
+      clearStateCookie();
+      res.redirect('/login?auth_error=invalid_state');
+      return;
+    }
+
+    try {
+      const exchanged = await exchangeCodeForGoogleProfile(
+        code,
+        creds.clientId,
+        creds.clientSecret,
+        resolveGoogleRedirectUri(req)
+      );
+      if (exchanged.errorCode || !exchanged.profile) {
+        clearStateCookie();
+        res.redirect(`/login?auth_error=${exchanged.errorCode || 'oauth_callback_error'}`);
+        return;
+      }
+
+      await issueSessionForGoogleProfile(req, res, exchanged.profile, verifiedState.role);
+      clearStateCookie();
+
+      const dest = sanitizeReturnTo(verifiedState.returnTo);
+      const separator = dest.includes('?') ? '&' : '?';
+      res.redirect(`${dest}${separator}auth_provider=google`);
+    } catch (error) {
+      console.error('Google OAuth callback error:', error);
+      clearStateCookie();
+      res.redirect('/login?auth_error=oauth_callback_error');
+    }
+  });
+
+  // Handles Google Authorization Code redirect returning to origin root (e.g. https://haggle-six.vercel.app/?code=...&state=...)
+  app.post('/api/auth/google/exchange', async (req, res) => {
+    const secure = isSecureRequest(req);
+    const clearStateCookie = () =>
+      res.clearCookie('haggle_oauth_state', { path: '/', httpOnly: true, sameSite: 'lax', secure });
+
+    const creds = getGoogleOAuthCredentials();
+    const { code, state } = (req.body || {}) as { code?: string; state?: string };
+
+    if (!creds || !code || !state) {
+      clearStateCookie();
+      res.status(400).json({ error: 'Missing OAuth code or configuration' });
+      return;
+    }
+
+    const cookies = parseCookies(req.headers.cookie);
+    const verifiedState = verifySignedToken<OAuthStatePayload>(state);
+    if (!verifiedState || !cookies.haggle_oauth_state || verifiedState.nonce !== cookies.haggle_oauth_state) {
+      clearStateCookie();
+      res.status(401).json({ error: 'Invalid or expired OAuth state' });
+      return;
+    }
+
+    try {
+      const exchanged = await exchangeCodeForGoogleProfile(
+        code,
+        creds.clientId,
+        creds.clientSecret,
+        resolveGoogleRedirectUri(req)
+      );
+      if (exchanged.errorCode || !exchanged.profile) {
+        clearStateCookie();
+        res.status(401).json({ error: exchanged.errorCode || 'Google authorization failed' });
+        return;
+      }
+
+      const { user, token } = await issueSessionForGoogleProfile(
+        req,
+        res,
+        exchanged.profile,
+        verifiedState.role
+      );
+      clearStateCookie();
+      res.json({
+        authenticated: true,
+        user,
+        token,
+        returnTo: sanitizeReturnTo(verifiedState.returnTo),
+      });
+    } catch (error) {
+      console.error('Google OAuth code exchange error:', error);
+      clearStateCookie();
+      res.status(500).json({ error: 'Failed to complete Google sign-in' });
+    }
+  });
+
+  // Verifies Google Identity Services (ID Token JWT or OAuth Access Token) directly without needing client_secret on serverless
+  app.post('/api/auth/google/verify', async (req, res) => {
+    const { credential, accessToken, role: rawRole } = (req.body || {}) as {
+      credential?: string;
+      accessToken?: string;
+      role?: string;
+    };
+    const role: 'shopper' | 'maker' = rawRole === 'maker' ? 'maker' : 'shopper';
+    const expectedClientId = getPublicGoogleClientId();
+
+    if (!credential && !accessToken) {
+      res.status(400).json({ error: 'Missing Google credential or access token' });
+      return;
+    }
+
+    try {
+      let verifiedProfile: VerifiedGoogleProfile | null = null;
+
+      if (credential) {
+        const infoRes = await fetch(
+          `https://oauth2.googleapis.com/tokeninfo?id_token=${encodeURIComponent(credential)}`
+        );
+        if (!infoRes.ok) {
+          res.status(401).json({ error: 'Google ID token verification failed' });
+          return;
+        }
+        const info = (await infoRes.json()) as {
+          aud?: string;
+          sub?: string;
+          email?: string;
+          email_verified?: string | boolean;
+          name?: string;
+          picture?: string;
+          exp?: string;
+        };
+        const expSec = Number(info.exp || 0);
+        const nowSec = Math.floor(Date.now() / 1000);
+        const emailVerified = info.email_verified === true || info.email_verified === 'true';
+
+        if (info.aud !== expectedClientId || !info.sub || !info.email || !emailVerified || expSec <= nowSec) {
+          res.status(401).json({ error: 'Google credential audience or signature mismatch' });
+          return;
+        }
+
+        verifiedProfile = {
+          sub: info.sub,
+          email: info.email,
+          name: info.name,
+          picture: info.picture,
+        };
+      } else if (accessToken) {
+        const tokenInfoRes = await fetch(
+          `https://www.googleapis.com/oauth2/v3/tokeninfo?access_token=${encodeURIComponent(accessToken)}`
+        );
+        if (!tokenInfoRes.ok) {
+          res.status(401).json({ error: 'Google access token verification failed' });
+          return;
+        }
+        const tokenInfo = (await tokenInfoRes.json()) as {
+          aud?: string;
+          azp?: string;
+          exp?: string;
+        };
+        const expSec = Number(tokenInfo.exp || 0);
+        const nowSec = Math.floor(Date.now() / 1000);
+        const matchesClient =
+          tokenInfo.aud === expectedClientId || tokenInfo.azp === expectedClientId;
+        if (!matchesClient || expSec <= nowSec) {
+          res.status(401).json({ error: 'Google access token does not belong to this app' });
+          return;
+        }
+
+        const userRes = await fetch('https://www.googleapis.com/oauth2/v3/userinfo', {
+          headers: { Authorization: `Bearer ${accessToken}` },
+        });
+        if (!userRes.ok) {
+          res.status(401).json({ error: 'Could not read verified Google profile' });
+          return;
+        }
+        const profileJson = (await userRes.json()) as {
+          sub?: string;
+          email?: string;
+          email_verified?: boolean;
+          name?: string;
+          picture?: string;
+        };
+        if (!profileJson.sub || !profileJson.email || profileJson.email_verified === false) {
+          res.status(401).json({ error: 'Google email is missing or unverified' });
+          return;
+        }
+
+        verifiedProfile = {
+          sub: profileJson.sub,
+          email: profileJson.email,
+          name: profileJson.name,
+          picture: profileJson.picture,
+        };
+      }
+
+      if (!verifiedProfile) {
+        res.status(401).json({ error: 'Unable to verify Google identity' });
+        return;
+      }
+
+      const { user, token } = await issueSessionForGoogleProfile(req, res, verifiedProfile, role);
+      res.json({ authenticated: true, user, token });
+    } catch (error) {
+      console.error('Google GSI verify error:', error);
+      res.status(500).json({ error: 'Failed to verify Google Sign-In' });
+    }
+  });
+
   app.post('/api/auth/sync', requireAuth, async (req: AuthRequest, res) => {
     try {
       const uid = req.user?.uid;
@@ -858,9 +1308,10 @@ async function startLocalServer() {
 }
 
 const isMainModule =
+  typeof import.meta?.url === 'string' &&
   Boolean(process.argv[1]) &&
   path.resolve(process.argv[1]) === path.resolve(__filename);
 
-if (isMainModule && !process.env.VERCEL) {
+if (isMainModule && !process.env.VERCEL && !process.env.VERCEL_ENV && !process.env.AWS_LAMBDA_FUNCTION_NAME) {
   startLocalServer();
 }

@@ -1,5 +1,5 @@
-import React, { useState } from 'react';
-import { signInWithPopup } from 'firebase/auth';
+import React, { useState, useEffect, useRef } from 'react';
+import { signInWithPopup, signInWithRedirect } from 'firebase/auth';
 import {
   ArrowLeft,
   Mail,
@@ -13,7 +13,12 @@ import {
   ArrowRight,
   Sparkles,
 } from 'lucide-react';
-import { auth, googleAuthProvider } from '../lib/firebase';
+import { auth, googleAuthProvider, activeFirebaseProjectId } from '../lib/firebase';
+import {
+  DEFAULT_GOOGLE_CLIENT_ID,
+  loadGoogleGsiScript,
+  verifyGoogleCredentialWithServer,
+} from '../lib/googleGsi';
 import type { ActiveRoute } from './Navbar';
 
 export interface AuthUserProfile {
@@ -23,11 +28,33 @@ export interface AuthUserProfile {
   photoUrl?: string;
 }
 
+interface AuthProviderInfo {
+  directGoogleEnabled: boolean;
+  googleClientId?: string;
+  redirectUri: string;
+  origin: string;
+}
+
 interface LoginPageProps {
   onNavigate: (route: ActiveRoute) => void;
-  onLoginSuccess: (user: AuthUserProfile) => void;
+  onLoginSuccess: (user: AuthUserProfile, token?: string) => void;
   initialRole?: 'shopper' | 'maker';
   initialMode?: 'signin' | 'signup';
+  initialAuthError?: string | null;
+}
+
+function formatRedirectAuthError(code: string): string {
+  switch (code) {
+    case 'access_denied':
+    case 'cancelled':
+      return 'Google sign-in was cancelled. You can try again anytime.';
+    case 'google_not_configured':
+      return 'Server OAuth secret not configured yet. Try the Google button or add GOOGLE_CLIENT_SECRET to environment variables.';
+    case 'email_unverified':
+      return 'Your Google email address is not verified.';
+    default:
+      return `Google sign-in could not be completed (${code}). Please try again.`;
+  }
 }
 
 export const LoginPage: React.FC<LoginPageProps> = ({
@@ -35,6 +62,7 @@ export const LoginPage: React.FC<LoginPageProps> = ({
   onLoginSuccess,
   initialRole = 'shopper',
   initialMode = 'signin',
+  initialAuthError = null,
 }) => {
   const [role, setRole] = useState<'shopper' | 'maker'>(initialRole);
   const [mode, setMode] = useState<'signin' | 'signup'>(initialMode);
@@ -43,17 +71,181 @@ export const LoginPage: React.FC<LoginPageProps> = ({
   const [name, setName] = useState('');
   const [agreedTerms, setAgreedTerms] = useState(true);
   const [loading, setLoading] = useState(false);
-  const [errorMessage, setErrorMessage] = useState<string | null>(null);
+  const [errorMessage, setErrorMessage] = useState<string | null>(() =>
+    initialAuthError ? formatRedirectAuthError(initialAuthError) : null
+  );
   const [successNotice, setSuccessNotice] = useState<string | null>(null);
+  const [providers, setProviders] = useState<AuthProviderInfo | null>(null);
+  const [gisReady, setGisReady] = useState(false);
+
+  const googleBtnRef = useRef<HTMLDivElement | null>(null);
+  const roleRef = useRef(role);
+  const modeRef = useRef(mode);
+  roleRef.current = role;
+  modeRef.current = mode;
+
+  const activeGoogleClientId =
+    providers?.googleClientId ||
+    import.meta.env.VITE_GOOGLE_CLIENT_ID ||
+    DEFAULT_GOOGLE_CLIENT_ID;
+
+  useEffect(() => {
+    fetch('/api/auth/providers')
+      .then((res) => (res.ok ? res.json() : null))
+      .then((data: AuthProviderInfo | null) => {
+        if (data) setProviders(data);
+      })
+      .catch(() => {});
+  }, []);
+
+  // Initialize official Google Identity Services button (works natively on https://haggle-six.vercel.app)
+  useEffect(() => {
+    let cancelled = false;
+    loadGoogleGsiScript().then((loaded) => {
+      if (cancelled || !loaded || !window.google?.accounts?.id || !googleBtnRef.current) return;
+
+      try {
+        window.google.accounts.id.initialize({
+          client_id: activeGoogleClientId,
+          callback: async (response) => {
+            if (!response.credential) {
+              setErrorMessage('Google did not return a credential token. Please try again.');
+              return;
+            }
+            setLoading(true);
+            setErrorMessage(null);
+            try {
+              const selectedRole = roleRef.current;
+              const { user, token } = await verifyGoogleCredentialWithServer({
+                credential: response.credential,
+                role: selectedRole,
+              });
+              setSuccessNotice(
+                modeRef.current === 'signup'
+                  ? `Account created! Welcome to Haggle, ${user.name}.`
+                  : `Signed in successfully as ${user.email}!`
+              );
+              setTimeout(() => {
+                onLoginSuccess(user, token);
+                onNavigate(selectedRole === 'maker' ? { view: 'seller' } : { view: 'catalog' });
+              }, 350);
+            } catch (err: unknown) {
+              setErrorMessage(
+                err instanceof Error ? err.message : 'Could not verify Google account.'
+              );
+            } finally {
+              setLoading(false);
+            }
+          },
+          ux_mode: 'popup',
+        });
+
+        googleBtnRef.current.innerHTML = '';
+        const btnWidth = Math.min(384, Math.max(240, googleBtnRef.current.clientWidth || 340));
+        window.google.accounts.id.renderButton(googleBtnRef.current, {
+          theme: 'outline',
+          size: 'large',
+          text: mode === 'signup' ? 'signup_with' : 'continue_with',
+          shape: 'rectangular',
+          width: btnWidth,
+          logo_alignment: 'center',
+        });
+        setGisReady(true);
+      } catch (err) {
+        console.warn('Google GIS button setup fallback:', err);
+      }
+    });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [activeGoogleClientId, mode, onLoginSuccess, onNavigate]);
 
   const handleGoogleAuth = async () => {
+    setErrorMessage(null);
+
+    // 1. Prefer Google Identity Services OAuth2 token client directly on user click (uses registered javascript_origins)
+    if (window.google?.accounts?.oauth2) {
+      setLoading(true);
+      try {
+        const tokenClient = window.google.accounts.oauth2.initTokenClient({
+          client_id: activeGoogleClientId,
+          scope: 'openid email profile',
+          callback: async (tokenResp) => {
+            if (tokenResp.error || !tokenResp.access_token) {
+              setLoading(false);
+              setErrorMessage(
+                tokenResp.error_description ||
+                  `Google Sign-In was cancelled or blocked (${tokenResp.error || 'access_denied'}).`
+              );
+              return;
+            }
+            try {
+              const selectedRole = roleRef.current;
+              const { user, token } = await verifyGoogleCredentialWithServer({
+                accessToken: tokenResp.access_token,
+                role: selectedRole,
+              });
+              setSuccessNotice(
+                modeRef.current === 'signup'
+                  ? `Account created! Welcome to Haggle, ${user.name}.`
+                  : `Signed in successfully as ${user.email}!`
+              );
+              setTimeout(() => {
+                onLoginSuccess(user, token);
+                onNavigate(selectedRole === 'maker' ? { view: 'seller' } : { view: 'catalog' });
+              }, 350);
+            } catch (err: unknown) {
+              setErrorMessage(
+                err instanceof Error ? err.message : 'Google token verification failed.'
+              );
+            } finally {
+              setLoading(false);
+            }
+          },
+          error_callback: (err) => {
+            setLoading(false);
+            if (err?.type === 'popup_failed_to_open' && providers?.directGoogleEnabled) {
+              const returnTo = roleRef.current === 'maker' ? '/seller' : '/';
+              window.location.assign(
+                `/api/auth/google?role=${encodeURIComponent(roleRef.current)}&mode=${encodeURIComponent(modeRef.current)}&returnTo=${encodeURIComponent(returnTo)}`
+              );
+              return;
+            }
+            setErrorMessage(
+              err?.message || 'Google Sign-In popup closed before completing. Please try again.'
+            );
+          },
+        });
+        tokenClient.requestAccessToken({ prompt: 'select_account' });
+        return;
+      } catch {
+        setLoading(false);
+      }
+    }
+
+    // 2. Full-page Google OAuth 2.0 redirect when direct server credentials are available
+    if (providers?.directGoogleEnabled) {
+      setLoading(true);
+      const returnTo = role === 'maker' ? '/seller' : '/';
+      window.location.assign(
+        `/api/auth/google?role=${encodeURIComponent(role)}&mode=${encodeURIComponent(mode)}&returnTo=${encodeURIComponent(returnTo)}`
+      );
+      return;
+    }
+
+    // 3. Fallback to Firebase Auth popup / redirect
     try {
       setLoading(true);
-      setErrorMessage(null);
+      try {
+        sessionStorage.setItem('haggle_pending_auth_role', role);
+      } catch {
+        // Ignored
+      }
+
       const credential = await signInWithPopup(auth, googleAuthProvider);
       const token = await credential.user.getIdToken();
 
-      // Sync user profile to backend Cloud SQL users table
       try {
         await fetch('/api/auth/sync', {
           method: 'POST',
@@ -68,7 +260,8 @@ export const LoginPage: React.FC<LoginPageProps> = ({
 
       const profile: AuthUserProfile = {
         email: credential.user.email || 'user@haggle.market',
-        name: credential.user.displayName || (role === 'maker' ? 'Studio Maker' : 'Handmade Collector'),
+        name:
+          credential.user.displayName || (role === 'maker' ? 'Studio Maker' : 'Handmade Collector'),
         role,
         photoUrl: credential.user.photoURL || undefined,
       };
@@ -79,7 +272,7 @@ export const LoginPage: React.FC<LoginPageProps> = ({
           : `Signed in successfully as ${profile.email}!`
       );
       setTimeout(() => {
-        onLoginSuccess(profile);
+        onLoginSuccess(profile, token);
         if (role === 'maker') {
           onNavigate({ view: 'seller' });
         } else {
@@ -87,8 +280,33 @@ export const LoginPage: React.FC<LoginPageProps> = ({
         }
       }, 400);
     } catch (err: unknown) {
+      const code = (err as any)?.code as string | undefined;
+      if (code === 'auth/popup-blocked') {
+        try {
+          await signInWithRedirect(auth, googleAuthProvider);
+          return;
+        } catch (redirectErr) {
+          console.error('Google Redirect fallback error:', redirectErr);
+        }
+      }
+
       console.error('Google Auth error:', err);
-      setErrorMessage('Google Sign-In was cancelled or popup was blocked in preview.');
+      const currentOrigin = typeof window !== 'undefined' ? window.location.origin : 'this domain';
+      if (code === 'auth/unauthorized-domain') {
+        setErrorMessage(
+          `Add "${currentOrigin}" to Google Cloud Authorized JavaScript Origins (or use https://haggle-six.vercel.app) — Firebase project "${activeFirebaseProjectId}" has not authorized this domain.`
+        );
+      } else if (code === 'auth/popup-blocked') {
+        setErrorMessage(
+          'Google popup was blocked by your browser. Please allow popups for this site and try again.'
+        );
+      } else if (code === 'auth/popup-closed-by-user') {
+        setErrorMessage('Google sign-in popup was closed before finishing. Please try again.');
+      } else {
+        setErrorMessage(
+          `Google Sign-In could not complete (${code || 'blocked'}). Verify "${currentOrigin}" is authorized in Google Cloud Console.`
+        );
+      }
     } finally {
       setLoading(false);
     }
@@ -290,9 +508,29 @@ export const LoginPage: React.FC<LoginPageProps> = ({
 
           {/* Feedback Alerts */}
           {errorMessage && (
-            <div className="p-3 rounded-xl bg-red-50 border border-red-200 text-xs font-medium text-red-800 flex items-center gap-2">
-              <AlertCircle className="w-4 h-4 shrink-0" />
-              <span>{errorMessage}</span>
+            <div className="p-3.5 rounded-xl bg-red-50 border border-red-200 text-xs font-medium text-red-800 space-y-2">
+              <div className="flex items-start gap-2">
+                <AlertCircle className="w-4 h-4 shrink-0 mt-0.5 text-red-600" />
+                <span className="leading-relaxed">{errorMessage}</span>
+              </div>
+              <div className="flex flex-wrap items-center gap-2 pt-1.5 border-t border-red-200/80">
+                <button
+                  type="button"
+                  onClick={() => handleDemoSignIn(role)}
+                  className="px-2.5 py-1 text-[11px] font-bold bg-[#1E1B18] text-white rounded-md hover:bg-[#8B4B24] transition-colors cursor-pointer"
+                >
+                  Continue with 1-Click {role === 'maker' ? 'Maker' : 'Shopper'} Demo
+                </button>
+                {role === 'shopper' && (
+                  <button
+                    type="button"
+                    onClick={handlePayPalAuth}
+                    className="px-2.5 py-1 text-[11px] font-bold bg-[#FFC439] text-[#003087] rounded-md hover:bg-[#F2B829] transition-colors cursor-pointer"
+                  >
+                    Use PayPal Instead
+                  </button>
+                )}
+              </div>
             </div>
           )}
 
@@ -305,33 +543,41 @@ export const LoginPage: React.FC<LoginPageProps> = ({
 
           {/* Third-Party Fast Auth */}
           <div className="space-y-2.5">
-            {/* Google */}
-            <button
-              type="button"
-              disabled={loading}
-              onClick={handleGoogleAuth}
-              className="w-full py-2.5 px-4 rounded-xl border border-[#D5CBBF] hover:border-[#1E1B18] bg-white text-[#1E1B18] text-xs sm:text-sm font-semibold flex items-center justify-center gap-2.5 transition-colors cursor-pointer shadow-xs disabled:opacity-60"
-            >
-              <svg className="w-4 h-4" viewBox="0 0 24 24">
-                <path
-                  fill="#4285F4"
-                  d="M23.745 12.27c0-.7-.06-1.4-.19-2.07H12v4.51h6.6c-.29 1.52-1.14 2.8-2.4 3.65v3.05h3.88c2.27-2.09 3.665-5.17 3.665-9.14z"
-                />
-                <path
-                  fill="#34A853"
-                  d="M12 24c3.24 0 5.95-1.08 7.93-2.91l-3.88-3.05c-1.08.72-2.45 1.16-4.05 1.16-3.12 0-5.77-2.1-6.72-4.93H1.25v3.15C3.26 21.36 7.33 24 12 24z"
-                />
-                <path
-                  fill="#FBBC05"
-                  d="M5.28 14.27c-.25-.72-.38-1.49-.38-2.27s.13-1.55.38-2.27V6.58H1.25C.45 8.17 0 9.99 0 12s.45 3.83 1.25 5.42l4.03-3.15z"
-                />
-                <path
-                  fill="#EA4335"
-                  d="M12 4.75c1.77 0 3.35.61 4.6 1.8l3.42-3.42C17.95 1.19 15.24 0 12 0 7.33 0 3.26 2.64 1.25 6.58l4.03 3.15c.95-2.83 3.6-4.98 6.72-4.98z"
-                />
-              </svg>
-              <span>{mode === 'signup' ? 'Sign up with Google' : 'Continue with Google'}</span>
-            </button>
+            {/* Official Google Identity Services Button (automatically renders when GSI loads) */}
+            <div
+              ref={googleBtnRef}
+              className={gisReady ? 'w-full flex justify-center min-h-[44px]' : 'hidden'}
+            />
+
+            {/* Fallback Google Button (used before GSI loads or if OAuth2 token/redirect flow is active) */}
+            {!gisReady && (
+              <button
+                type="button"
+                disabled={loading}
+                onClick={handleGoogleAuth}
+                className="w-full py-2.5 px-4 rounded-xl border border-[#D5CBBF] hover:border-[#1E1B18] bg-white text-[#1E1B18] text-xs sm:text-sm font-semibold flex items-center justify-center gap-2.5 transition-colors cursor-pointer shadow-xs disabled:opacity-60"
+              >
+                <svg className="w-4 h-4" viewBox="0 0 24 24">
+                  <path
+                    fill="#4285F4"
+                    d="M23.745 12.27c0-.7-.06-1.4-.19-2.07H12v4.51h6.6c-.29 1.52-1.14 2.8-2.4 3.65v3.05h3.88c2.27-2.09 3.665-5.17 3.665-9.14z"
+                  />
+                  <path
+                    fill="#34A853"
+                    d="M12 24c3.24 0 5.95-1.08 7.93-2.91l-3.88-3.05c-1.08.72-2.45 1.16-4.05 1.16-3.12 0-5.77-2.1-6.72-4.93H1.25v3.15C3.26 21.36 7.33 24 12 24z"
+                  />
+                  <path
+                    fill="#FBBC05"
+                    d="M5.28 14.27c-.25-.72-.38-1.49-.38-2.27s.13-1.55.38-2.27V6.58H1.25C.45 8.17 0 9.99 0 12s.45 3.83 1.25 5.42l4.03-3.15z"
+                  />
+                  <path
+                    fill="#EA4335"
+                    d="M12 4.75c1.77 0 3.35.61 4.6 1.8l3.42-3.42C17.95 1.19 15.24 0 12 0 7.33 0 3.26 2.64 1.25 6.58l4.03 3.15c.95-2.83 3.6-4.98 6.72-4.98z"
+                  />
+                </svg>
+                <span>{mode === 'signup' ? 'Sign up with Google' : 'Continue with Google'}</span>
+              </button>
+            )}
 
             {/* PayPal for Shoppers */}
             {role === 'shopper' && (

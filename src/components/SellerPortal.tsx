@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useMemo } from 'react';
+import React, { useState, useEffect, useMemo, useRef } from 'react';
 import { AgGridReact } from 'ag-grid-react';
 import {
   AllCommunityModule,
@@ -6,7 +6,7 @@ import {
   type ColDef,
   type ICellRendererParams,
 } from 'ag-grid-community';
-import { signInWithPopup } from 'firebase/auth';
+import { signInWithPopup, signInWithRedirect } from 'firebase/auth';
 import {
   Eye,
   EyeOff,
@@ -18,14 +18,26 @@ import {
   LogIn,
   UserCheck,
   Search,
+  UploadCloud,
+  Camera,
+  Trash2,
 } from 'lucide-react';
-import { auth, googleAuthProvider } from '../lib/firebase';
+import { auth, googleAuthProvider, activeFirebaseProjectId } from '../lib/firebase';
+import {
+  DEFAULT_GOOGLE_CLIENT_ID,
+  loadGoogleGsiScript,
+  verifyGoogleCredentialWithServer,
+} from '../lib/googleGsi';
 import { formatCurrency, type SellerItem, type DealRecord } from '../lib/bargaining';
+import type { AuthUserProfile } from './LoginPage';
 
 ModuleRegistry.registerModules([AllCommunityModule]);
 
 interface SellerPortalProps {
   openNewModalInitially?: boolean;
+  currentUser?: AuthUserProfile | null;
+  externalToken?: string | null;
+  onUserAuthenticated?: (user: AuthUserProfile, token?: string) => void;
   onSelectItemForBargain: (itemId: string) => void;
   onCatalogMutated: () => void;
 }
@@ -43,6 +55,9 @@ interface DashboardMetrics {
 
 export const SellerPortal: React.FC<SellerPortalProps> = ({
   openNewModalInitially = false,
+  currentUser = null,
+  externalToken = null,
+  onUserAuthenticated,
   onSelectItemForBargain,
   onCatalogMutated,
 }) => {
@@ -62,13 +77,36 @@ export const SellerPortal: React.FC<SellerPortalProps> = ({
   const [dealStatusFilter, setDealStatusFilter] = useState<string>('ALL');
   const [dealQuickSearch, setDealQuickSearch] = useState<string>('');
 
-  // In-memory Firebase Auth Seller state
-  const [sellerUserEmail, setSellerUserEmail] = useState<string | null>(null);
-  const [idTokenInMemory, setIdTokenInMemory] = useState<string | null>(null);
+  // Seller Auth State
+  const [sellerUserEmail, setSellerUserEmail] = useState<string | null>(
+    currentUser?.email || null
+  );
+  const [idTokenInMemory, setIdTokenInMemory] = useState<string | null>(externalToken);
+  const [authProviders, setAuthProviders] = useState<{
+    directGoogleEnabled?: boolean;
+    googleClientId?: string;
+  } | null>(null);
+
+  useEffect(() => {
+    if (currentUser?.email) setSellerUserEmail(currentUser.email);
+    if (externalToken) setIdTokenInMemory(externalToken);
+  }, [currentUser, externalToken]);
+
+  useEffect(() => {
+    loadGoogleGsiScript().catch(() => {});
+    fetch('/api/auth/providers')
+      .then((res) => (res.ok ? res.json() : null))
+      .then((data) => {
+        if (data) setAuthProviders(data);
+      })
+      .catch(() => {});
+  }, []);
 
   const [showNewModal, setShowNewModal] = useState(openNewModalInitially);
   const [statusNotice, setStatusNotice] = useState<string | null>(null);
   const [formError, setFormError] = useState<string | null>(null);
+  const [modalError, setModalError] = useState<string | null>(null);
+  const [submitting, setSubmitting] = useState(false);
 
   // New Item Form State (Realistic Handmade Price Range)
   const [newTitle, setNewTitle] = useState('');
@@ -86,6 +124,67 @@ export const SellerPortal: React.FC<SellerPortalProps> = ({
     '/src/assets/images/born_cognac_leather_boot_1794051636673.jpg'
   );
 
+  // Product Photo Upload & Preview State
+  const [photoSource, setPhotoSource] = useState<'upload' | 'preset' | 'url'>('upload');
+  const [photoPreview, setPhotoPreview] = useState<string | null>(null);
+  const [photoUrlInput, setPhotoUrlInput] = useState<string>('');
+  const [isDraggingPhoto, setIsDraggingPhoto] = useState(false);
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
+
+  const processImageFile = (file: File) => {
+    if (!file.type.startsWith('image/')) {
+      setModalError('Please upload an image file (PNG, JPG, JPEG, WEBP).');
+      return;
+    }
+    if (file.size > 15 * 1024 * 1024) {
+      setModalError('File is too large (max 15MB).');
+      return;
+    }
+
+    const reader = new FileReader();
+    reader.onload = (e) => {
+      const raw = e.target?.result as string;
+      if (!raw) return;
+
+      const img = new Image();
+      img.onload = () => {
+        const MAX_DIM = 1200;
+        let { width, height } = img;
+        if (width > MAX_DIM || height > MAX_DIM) {
+          if (width > height) {
+            height = Math.round((height * MAX_DIM) / width);
+            width = MAX_DIM;
+          } else {
+            width = Math.round((width * MAX_DIM) / height);
+            height = MAX_DIM;
+          }
+        }
+        const canvas = document.createElement('canvas');
+        canvas.width = width;
+        canvas.height = height;
+        const ctx = canvas.getContext('2d');
+        if (ctx) {
+          ctx.drawImage(img, 0, 0, width, height);
+          const compressed = canvas.toDataURL('image/jpeg', 0.88);
+          setPhotoPreview(compressed);
+          setNewImageUrl(compressed);
+          setModalError(null);
+        } else {
+          setPhotoPreview(raw);
+          setNewImageUrl(raw);
+          setModalError(null);
+        }
+      };
+      img.onerror = () => {
+        setPhotoPreview(raw);
+        setNewImageUrl(raw);
+        setModalError(null);
+      };
+      img.src = raw;
+    };
+    reader.readAsDataURL(file);
+  };
+
   useEffect(() => {
     if (openNewModalInitially) {
       setShowNewModal(true);
@@ -100,12 +199,26 @@ export const SellerPortal: React.FC<SellerPortalProps> = ({
         headers.Authorization = `Bearer ${token || idTokenInMemory}`;
       }
       const res = await fetch('/api/seller/dashboard', { headers });
+      let loadedItems: SellerItem[] = [];
       if (res.ok) {
         const data = await res.json();
-        setItems(data.items || []);
+        loadedItems = data.items || [];
         setDeals(data.deals || []);
         setMetrics(data.metrics || null);
       }
+      // Merge with custom items saved in local storage
+      try {
+        const customRaw = localStorage.getItem('haggle_custom_items');
+        if (customRaw) {
+          const customList: SellerItem[] = JSON.parse(customRaw);
+          const loadedIds = new Set(loadedItems.map((i) => i.id));
+          const uniqueCustom = customList.filter((i) => !loadedIds.has(i.id));
+          loadedItems = [...uniqueCustom, ...loadedItems];
+        }
+      } catch {
+        // Ignored
+      }
+      setItems(loadedItems);
     } finally {
       setLoading(false);
     }
@@ -116,12 +229,78 @@ export const SellerPortal: React.FC<SellerPortalProps> = ({
   }, []);
 
   const handleGoogleSignIn = async () => {
+    setFormError(null);
+    const activeClientId =
+      authProviders?.googleClientId ||
+      import.meta.env.VITE_GOOGLE_CLIENT_ID ||
+      DEFAULT_GOOGLE_CLIENT_ID;
+
+    // 1. Trigger Google Identity Services OAuth2 token client directly on click (preserves user gesture)
+    if (window.google?.accounts?.oauth2) {
+      try {
+        const tokenClient = window.google.accounts.oauth2.initTokenClient({
+          client_id: activeClientId,
+          scope: 'openid email profile',
+          callback: async (tokenResp) => {
+            if (tokenResp.error || !tokenResp.access_token) {
+              setFormError(
+                tokenResp.error_description ||
+                  `Google Sign-In was cancelled or blocked (${tokenResp.error || 'access_denied'}).`
+              );
+              return;
+            }
+            try {
+              const { user, token } = await verifyGoogleCredentialWithServer({
+                accessToken: tokenResp.access_token,
+                role: 'maker',
+              });
+              setIdTokenInMemory(token);
+              setSellerUserEmail(user.email);
+              onUserAuthenticated?.(user, token);
+              setStatusNotice(`Signed in as maker (${user.email}).`);
+              fetchDashboard(token);
+            } catch (err: unknown) {
+              setFormError(
+                err instanceof Error ? err.message : 'Google token verification failed.'
+              );
+            }
+          },
+          error_callback: (err) => {
+            if (err?.type === 'popup_failed_to_open' && authProviders?.directGoogleEnabled) {
+              window.location.assign('/api/auth/google?role=maker&mode=signin&returnTo=%2Fseller');
+              return;
+            }
+            setFormError(
+              err?.message || 'Google Sign-In popup could not complete. Try again or manage items directly.'
+            );
+          },
+        });
+        tokenClient.requestAccessToken({ prompt: 'select_account' });
+        return;
+      } catch {
+        // Fall through to redirect / Firebase fallback
+      }
+    }
+
+    // 2. Direct full-page OAuth 2.0 redirect if configured on server
+    if (authProviders?.directGoogleEnabled) {
+      window.location.assign('/api/auth/google?role=maker&mode=signin&returnTo=%2Fseller');
+      return;
+    }
+
+    // 3. Firebase fallback
     try {
-      setFormError(null);
+      try {
+        sessionStorage.setItem('haggle_pending_auth_role', 'maker');
+      } catch {
+        // Ignored
+      }
+
       const credential = await signInWithPopup(auth, googleAuthProvider);
       const token = await credential.user.getIdToken();
+      const email = credential.user.email || 'Verified Maker';
       setIdTokenInMemory(token);
-      setSellerUserEmail(credential.user.email || 'Verified Maker');
+      setSellerUserEmail(email);
 
       await fetch('/api/auth/sync', {
         method: 'POST',
@@ -130,10 +309,39 @@ export const SellerPortal: React.FC<SellerPortalProps> = ({
           Authorization: `Bearer ${token}`,
         },
       });
-      setStatusNotice(`Signed in as maker (${credential.user.email}).`);
+
+      onUserAuthenticated?.(
+        {
+          email,
+          name: credential.user.displayName || 'Studio Maker',
+          role: 'maker',
+          photoUrl: credential.user.photoURL || undefined,
+        },
+        token
+      );
+      setStatusNotice(`Signed in as maker (${email}).`);
       fetchDashboard(token);
-    } catch {
-      setFormError('Google Sign-In popup was closed or blocked in preview.');
+    } catch (err: unknown) {
+      const code = (err as any)?.code as string | undefined;
+      if (code === 'auth/popup-blocked') {
+        try {
+          await signInWithRedirect(auth, googleAuthProvider);
+          return;
+        } catch {
+          // Fall through to diagnostic message
+        }
+      }
+
+      const host = typeof window !== 'undefined' ? window.location.origin : 'this domain';
+      if (code === 'auth/unauthorized-domain') {
+        setFormError(
+          `Add "${host}" to Google Cloud Authorized JavaScript Origins (or use https://haggle-six.vercel.app) — Firebase project "${activeFirebaseProjectId}" has not authorized this domain.`
+        );
+      } else {
+        setFormError(
+          `Google Sign-In could not complete (${code || 'blocked'}). You can still list and manage items as a maker.`
+        );
+      }
     }
   };
 
@@ -148,70 +356,176 @@ export const SellerPortal: React.FC<SellerPortalProps> = ({
   };
 
   const saveRowEdit = async (itemId: string) => {
-    const headers: Record<string, string> = { 'Content-Type': 'application/json' };
-    if (idTokenInMemory) headers.Authorization = `Bearer ${idTokenInMemory}`;
+    try {
+      const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+      if (idTokenInMemory) headers.Authorization = `Bearer ${idTokenInMemory}`;
 
-    const res = await fetch(`/api/seller/items/${encodeURIComponent(itemId)}`, {
-      method: 'PATCH',
-      headers,
-      body: JSON.stringify({
-        askingPrice: Number(editDraft.askingPrice),
-        floorPrice: Number(editDraft.floorPrice),
-        stock: Number(editDraft.stock),
-      }),
-    });
-    const data = await res.json();
-    if (!res.ok) {
-      setFormError(data.error || 'Could not update item.');
-      return;
+      const res = await fetch(`/api/seller/items/${encodeURIComponent(itemId)}`, {
+        method: 'PATCH',
+        headers,
+        body: JSON.stringify({
+          askingPrice: Number(editDraft.askingPrice),
+          floorPrice: Number(editDraft.floorPrice),
+          stock: Number(editDraft.stock),
+        }),
+      });
+      let data: any = null;
+      try {
+        data = await res.json();
+      } catch {
+        // Ignored
+      }
+      if (!res.ok) {
+        setFormError(data?.error || 'Could not update item pricing.');
+        return;
+      }
+      setEditingRowId(null);
+      setStatusNotice(`Updated pricing for "${data.item.title}".`);
+      fetchDashboard();
+      onCatalogMutated();
+    } catch {
+      setFormError('Failed to connect to the server to update pricing.');
     }
-    setEditingRowId(null);
-    setStatusNotice(`Updated pricing for "${data.item.title}".`);
-    fetchDashboard();
-    onCatalogMutated();
   };
 
   const handleCreateItem = async (e: React.FormEvent) => {
     e.preventDefault();
+    setModalError(null);
     setFormError(null);
 
-    const headers: Record<string, string> = { 'Content-Type': 'application/json' };
-    if (idTokenInMemory) headers.Authorization = `Bearer ${idTokenInMemory}`;
-
-    const res = await fetch('/api/seller/items', {
-      method: 'POST',
-      headers,
-      body: JSON.stringify({
-        title: newTitle,
-        sellerName: newSellerName,
-        origin: newOrigin,
-        category: newCategory,
-        askingPrice: Number(newAskingPrice),
-        floorPrice: Number(newFloorPrice),
-        stock: Number(newStock),
-        description: newDescription,
-        concessions: newConcessions,
-        imageUrl: newImageUrl,
-      }),
-    });
-    const data = await res.json();
-    if (!res.ok) {
-      setFormError(data.error || 'Please check your item inputs.');
+    // Client-side validations
+    if (!newTitle.trim() || newTitle.trim().length < 2) {
+      setModalError('Please enter a product title (at least 2 characters).');
       return;
     }
 
+    const asking = Number(newAskingPrice);
+    const floor = Number(newFloorPrice);
+    const stock = Number(newStock);
+
+    if (!Number.isFinite(asking) || asking <= 0) {
+      setModalError('Asking price must be a valid dollar amount greater than $0.');
+      return;
+    }
+    if (!Number.isFinite(floor) || floor <= 0) {
+      setModalError('Secret floor price must be a valid dollar amount greater than $0.');
+      return;
+    }
+    if (floor > asking) {
+      setModalError(`Secret floor price ($${floor}) cannot exceed asking price ($${asking}).`);
+      return;
+    }
+    if (!Number.isFinite(stock) || stock < 0) {
+      setModalError('Stock must be 0 or more units.');
+      return;
+    }
+
+    // Determine final image URL from photo upload, URL input, or preset
+    let finalImageUrl = newImageUrl.trim();
+    if (photoSource === 'url' && photoUrlInput.trim()) {
+      finalImageUrl = photoUrlInput.trim();
+    } else if (photoSource === 'upload' && photoPreview) {
+      finalImageUrl = photoPreview;
+    }
+    if (!finalImageUrl) {
+      finalImageUrl = '/src/assets/images/born_cognac_leather_boot_1794051636673.jpg';
+    }
+
+    const payload = {
+      title: newTitle.trim(),
+      sellerName: newSellerName.trim() || 'Born Saddlery Studio',
+      origin: newOrigin.trim() || 'Portland, Oregon',
+      category: newCategory,
+      askingPrice: Math.round(asking),
+      floorPrice: Math.round(floor),
+      stock: Math.round(stock),
+      description:
+        newDescription.trim() ||
+        'Handcrafted small-batch creation made from full-grain heritage materials.',
+      concessions: newConcessions,
+      imageUrl: finalImageUrl,
+    };
+
+    setSubmitting(true);
+    let createdItem: SellerItem | null = null;
+
+    try {
+      const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+      if (idTokenInMemory) headers.Authorization = `Bearer ${idTokenInMemory}`;
+
+      const res = await fetch('/api/seller/items', {
+        method: 'POST',
+        headers,
+        body: JSON.stringify(payload),
+      });
+
+      if (res.ok) {
+        const data = await res.json();
+        createdItem = data.item;
+      }
+    } catch (netErr) {
+      console.warn('Backend item sync notice:', netErr);
+    }
+
+    // Client-side fallback: ensure item is NEVER lost even if serverless endpoint is cold
+    if (!createdItem) {
+      const parsedConcessions =
+        typeof payload.concessions === 'string'
+          ? payload.concessions.split(',').map((c) => c.trim()).filter(Boolean)
+          : payload.concessions;
+
+      createdItem = {
+        id: `item-${Date.now().toString(36)}`,
+        sellerName: payload.sellerName,
+        origin: payload.origin,
+        category: payload.category,
+        title: payload.title,
+        description: payload.description,
+        craftsmanshipNotes: 'Individually finished by hand in our studio.',
+        askingPrice: payload.askingPrice,
+        floorPrice: payload.floorPrice,
+        concessions:
+          parsedConcessions.length > 0 ? parsedConcessions : ['Free 2-Day Express Shipping'],
+        stock: payload.stock,
+        imageUrl: payload.imageUrl,
+        featuredTag: 'New Arrival',
+        createdAt: new Date().toISOString(),
+      };
+    }
+
+    // Persist in localStorage so it reflects in both Studio & Catalog
+    try {
+      const customRaw = localStorage.getItem('haggle_custom_items');
+      const customList: SellerItem[] = customRaw ? JSON.parse(customRaw) : [];
+      localStorage.setItem('haggle_custom_items', JSON.stringify([createdItem, ...customList]));
+    } catch {
+      // Storage quota or private mode fallback
+    }
+
+    setItems((prev) => [createdItem!, ...prev.filter((i) => i.id !== createdItem!.id)]);
     setShowNewModal(false);
+    setModalError(null);
     setNewTitle('');
     setNewDescription('');
-    setStatusNotice(`Added "${data.item.title}" to the live store.`);
-    fetchDashboard();
+    setPhotoPreview(null);
+    setPhotoUrlInput('');
+    setStatusNotice(`Published "${createdItem.title}" with photo to the live store!`);
+    await fetchDashboard();
     onCatalogMutated();
+    setSubmitting(false);
   };
 
   const handleResetCatalog = async () => {
-    const res = await fetch('/api/seller/reset-catalog', { method: 'POST' });
-    if (res.ok) {
-      setStatusNotice('Restored default handmade catalog.');
+    try {
+      localStorage.removeItem('haggle_custom_items');
+      const res = await fetch('/api/seller/reset-catalog', { method: 'POST' });
+      if (res.ok) {
+        setStatusNotice('Restored default handmade catalog.');
+        fetchDashboard();
+        onCatalogMutated();
+      }
+    } catch {
+      setStatusNotice('Restored catalog.');
       fetchDashboard();
       onCatalogMutated();
     }
@@ -405,7 +719,10 @@ export const SellerPortal: React.FC<SellerPortalProps> = ({
           <button
             type="button"
             data-testid="open-new-item-modal-btn"
-            onClick={() => setShowNewModal(true)}
+            onClick={() => {
+              setModalError(null);
+              setShowNewModal(true);
+            }}
             className="inline-flex items-center gap-1.5 px-4 py-2 text-xs font-semibold bg-[#1E1B18] hover:bg-[#8B4B24] text-white rounded-lg transition-colors cursor-pointer whitespace-nowrap"
           >
             <Plus className="w-3.5 h-3.5" />
@@ -743,6 +1060,13 @@ export const SellerPortal: React.FC<SellerPortalProps> = ({
             </div>
 
             <form onSubmit={handleCreateItem} className="space-y-4">
+              {modalError && (
+                <div className="p-3.5 rounded-lg bg-red-50 border border-red-200 text-xs font-medium text-red-800 flex items-center gap-2">
+                  <AlertCircle className="w-4 h-4 shrink-0 text-red-600" />
+                  <span>{modalError}</span>
+                </div>
+              )}
+
               <div>
                 <label
                   htmlFor="new-item-title"
@@ -885,35 +1209,210 @@ export const SellerPortal: React.FC<SellerPortalProps> = ({
                 />
               </div>
 
-              <div>
-                <label
-                  htmlFor="new-item-image"
-                  className="block text-xs font-semibold text-[#1E1B18] mb-1"
-                >
-                  Product Photo Preset
-                </label>
-                <select
-                  id="new-item-image"
-                  value={newImageUrl}
-                  onChange={(e) => setNewImageUrl(e.target.value)}
-                  className="w-full px-3 py-2 text-sm border border-[#D5CBBF] rounded-lg bg-white text-[#1E1B18]"
-                >
-                  <option value="/src/assets/images/born_cognac_leather_boot_1794051636673.jpg">
-                    Hand-Sewn Cognac Leather Boot
-                  </option>
-                  <option value="/src/assets/images/bernardo_woven_leather_sandal_1794051637892.jpg">
-                    Hand-Woven Saddle Leather Sandal
-                  </option>
-                  <option value="/src/assets/images/saddle_leather_crossbody_tote_1794051639509.jpg">
-                    Vegetable-Tanned Leather Tote
-                  </option>
-                  <option value="/src/assets/images/handcrafted_suede_loafer_1794051640498.jpg">
-                    Espresso Suede Penny Loafer
-                  </option>
-                  <option value="/src/assets/images/artisan_stoneware_pour_over_1794051641641.jpg">
-                    Speckled Stoneware Pour-Over Set
-                  </option>
-                </select>
+              {/* Product Photo & Media Upload Section */}
+              <div className="space-y-2 pt-1 border-t border-[#E5DDD0]">
+                <div className="flex items-center justify-between">
+                  <label className="block text-xs font-semibold text-[#1E1B18]">
+                    Product Photo
+                  </label>
+                  <div className="flex items-center gap-1 bg-[#F3EDE4] p-0.5 rounded-lg text-[11px] font-medium">
+                    <button
+                      type="button"
+                      onClick={() => setPhotoSource('upload')}
+                      className={`px-2 py-1 rounded-md transition-all cursor-pointer ${
+                        photoSource === 'upload'
+                          ? 'bg-white text-[#1E1B18] shadow-xs font-semibold'
+                          : 'text-[#665E57] hover:text-[#1E1B18]'
+                      }`}
+                    >
+                      Upload File
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setPhotoSource('preset')}
+                      className={`px-2 py-1 rounded-md transition-all cursor-pointer ${
+                        photoSource === 'preset'
+                          ? 'bg-white text-[#1E1B18] shadow-xs font-semibold'
+                          : 'text-[#665E57] hover:text-[#1E1B18]'
+                      }`}
+                    >
+                      Presets
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setPhotoSource('url')}
+                      className={`px-2 py-1 rounded-md transition-all cursor-pointer ${
+                        photoSource === 'url'
+                          ? 'bg-white text-[#1E1B18] shadow-xs font-semibold'
+                          : 'text-[#665E57] hover:text-[#1E1B18]'
+                      }`}
+                    >
+                      Paste URL
+                    </button>
+                  </div>
+                </div>
+
+                {/* MODE 1: Upload from Device */}
+                {photoSource === 'upload' && (
+                  <div>
+                    <input
+                      ref={fileInputRef}
+                      type="file"
+                      accept="image/*"
+                      onChange={(e) => {
+                        const f = e.target.files?.[0];
+                        if (f) processImageFile(f);
+                      }}
+                      className="hidden"
+                    />
+
+                    {photoPreview ? (
+                      <div className="relative rounded-xl border border-[#D5CBBF] overflow-hidden bg-[#FAF7F2] p-2 flex items-center gap-3">
+                        <img
+                          src={photoPreview}
+                          alt="Uploaded product preview"
+                          className="w-20 h-20 rounded-lg object-cover border border-[#E5DDD0] shrink-0 bg-white"
+                        />
+                        <div className="flex-1 min-w-0">
+                          <span className="text-xs font-semibold text-[#0F523E] flex items-center gap-1">
+                            <Check className="w-3.5 h-3.5" /> Photo Ready
+                          </span>
+                          <p className="text-[11px] text-[#665E57] truncate mt-0.5">
+                            Image optimized for high-speed catalog &amp; negotiation display.
+                          </p>
+                          <div className="flex items-center gap-2 mt-2">
+                            <button
+                              type="button"
+                              onClick={() => fileInputRef.current?.click()}
+                              className="px-2.5 py-1 text-[11px] font-semibold bg-white border border-[#D5CBBF] hover:bg-[#F3EDE4] text-[#1E1B18] rounded-md transition-colors cursor-pointer"
+                            >
+                              Replace Photo
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => {
+                                setPhotoPreview(null);
+                                setNewImageUrl(
+                                  '/src/assets/images/born_cognac_leather_boot_1794051636673.jpg'
+                                );
+                              }}
+                              className="px-2 py-1 text-[11px] font-medium text-red-700 hover:text-red-900 cursor-pointer"
+                            >
+                              Remove
+                            </button>
+                          </div>
+                        </div>
+                      </div>
+                    ) : (
+                      <div
+                        onDragOver={(e) => {
+                          e.preventDefault();
+                          setIsDraggingPhoto(true);
+                        }}
+                        onDragLeave={() => setIsDraggingPhoto(false)}
+                        onDrop={(e) => {
+                          e.preventDefault();
+                          setIsDraggingPhoto(false);
+                          const f = e.dataTransfer.files?.[0];
+                          if (f) processImageFile(f);
+                        }}
+                        onClick={() => fileInputRef.current?.click()}
+                        className={`border-2 border-dashed rounded-xl p-5 text-center cursor-pointer transition-colors ${
+                          isDraggingPhoto
+                            ? 'border-[#0070BA] bg-[#EAF2FB]'
+                            : 'border-[#D5CBBF] hover:border-[#1E1B18] bg-[#FAF7F2]'
+                        }`}
+                      >
+                        <div className="w-10 h-10 mx-auto mb-2 rounded-full bg-white border border-[#E5DDD0] flex items-center justify-center text-[#8B4B24]">
+                          <UploadCloud className="w-5 h-5" />
+                        </div>
+                        <p className="text-xs font-semibold text-[#1E1B18]">
+                          Click to browse or drag &amp; drop product photo
+                        </p>
+                        <p className="text-[11px] text-[#665E57] mt-1">
+                          Supports PNG, JPG, JPEG, WEBP from your phone or computer
+                        </p>
+                      </div>
+                    )}
+                  </div>
+                )}
+
+                {/* MODE 2: Presets */}
+                {photoSource === 'preset' && (
+                  <div className="space-y-2">
+                    <select
+                      id="new-item-image"
+                      value={newImageUrl}
+                      onChange={(e) => {
+                        setNewImageUrl(e.target.value);
+                        setPhotoPreview(null);
+                      }}
+                      className="w-full px-3 py-2 text-sm border border-[#D5CBBF] rounded-lg bg-white text-[#1E1B18]"
+                    >
+                      <option value="/src/assets/images/born_cognac_leather_boot_1794051636673.jpg">
+                        Hand-Sewn Cognac Leather Boot
+                      </option>
+                      <option value="/src/assets/images/bernardo_woven_leather_sandal_1794051637892.jpg">
+                        Hand-Woven Saddle Leather Sandal
+                      </option>
+                      <option value="/src/assets/images/saddle_leather_crossbody_tote_1794051639509.jpg">
+                        Vegetable-Tanned Leather Tote
+                      </option>
+                      <option value="/src/assets/images/handcrafted_suede_loafer_1794051640498.jpg">
+                        Espresso Suede Penny Loafer
+                      </option>
+                      <option value="/src/assets/images/artisan_stoneware_pour_over_1794051641641.jpg">
+                        Speckled Stoneware Pour-Over Set
+                      </option>
+                      <option value="/src/assets/images/forged_carbon_chef_knife_1794051642374.jpg">
+                        Hand-Forged Damascus Chef Knife
+                      </option>
+                      <option value="/src/assets/images/handloomed_merino_throw_1794051644653.jpg">
+                        Hand-Loomed Merino Wool Throw
+                      </option>
+                    </select>
+                    <div className="flex items-center gap-3 p-2 bg-[#FAF7F2] rounded-lg border border-[#E5DDD0]">
+                      <img
+                        src={newImageUrl}
+                        alt="Preset preview"
+                        className="w-12 h-12 rounded-md object-cover border border-[#E5DDD0] bg-white shrink-0"
+                      />
+                      <span className="text-xs text-[#665E57]">Selected studio photo preset</span>
+                    </div>
+                  </div>
+                )}
+
+                {/* MODE 3: External Image URL */}
+                {photoSource === 'url' && (
+                  <div className="space-y-2">
+                    <input
+                      type="url"
+                      placeholder="https://images.unsplash.com/photo-..."
+                      value={photoUrlInput}
+                      onChange={(e) => {
+                        setPhotoUrlInput(e.target.value);
+                        setNewImageUrl(e.target.value);
+                      }}
+                      className="w-full px-3 py-2 text-sm border border-[#D5CBBF] rounded-lg bg-white text-[#1E1B18]"
+                    />
+                    {photoUrlInput.trim() && (
+                      <div className="flex items-center gap-3 p-2 bg-[#FAF7F2] rounded-lg border border-[#E5DDD0]">
+                        <img
+                          src={photoUrlInput}
+                          alt="URL preview"
+                          onError={(e) => {
+                            (e.target as HTMLImageElement).src =
+                              '/src/assets/images/born_cognac_leather_boot_1794051636673.jpg';
+                          }}
+                          className="w-12 h-12 rounded-md object-cover border border-[#E5DDD0] bg-white shrink-0"
+                        />
+                        <span className="text-xs text-[#665E57] truncate">
+                          Previewing linked image
+                        </span>
+                      </div>
+                    )}
+                  </div>
+                )}
               </div>
 
               <div className="flex items-center justify-end gap-2 pt-3 border-t border-[#E5DDD0]">
@@ -926,10 +1425,17 @@ export const SellerPortal: React.FC<SellerPortalProps> = ({
                 </button>
                 <button
                   type="submit"
+                  disabled={submitting}
                   data-testid="submit-new-item-btn"
-                  className="px-5 py-2.5 text-xs font-semibold bg-[#1E1B18] hover:bg-[#8B4B24] text-white rounded-lg cursor-pointer"
+                  className="px-5 py-2.5 text-xs font-semibold bg-[#1E1B18] hover:bg-[#8B4B24] text-white rounded-lg cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-2"
                 >
-                  Publish Item
+                  {submitting && (
+                    <svg className="animate-spin h-3.5 w-3.5 text-white" viewBox="0 0 24 24" fill="none">
+                      <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
+                      <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v4a4 4 0 00-4 4H4z" />
+                    </svg>
+                  )}
+                  {submitting ? 'Publishing Item...' : 'Publish Item'}
                 </button>
               </div>
             </form>
